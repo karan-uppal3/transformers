@@ -214,23 +214,10 @@ class SwitchTransformersLayerNorm(nn.Module):
         Construct a layernorm module in the SwitchTransformers style. No bias and no subtraction of mean.
         """
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
+        self.layer_norm = nn.LayerNorm(hidden_size, eps=eps)
 
     def forward(self, hidden_states):
-        # SwitchTransformers uses a layer_norm which only scales and doesn't shift, which is also known as Root Mean
-        # Square Layer Normalization https://arxiv.org/abs/1910.07467 thus varience is calculated
-        # w/o mean and there is no bias. Additionally we want to make sure that the accumulation for
-        # half-precision inputs is done in fp32
-
-        variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-
-        # convert into half-precision if necessary
-        if self.weight.dtype in [torch.float16, torch.bfloat16]:
-            hidden_states = hidden_states.to(self.weight.dtype)
-
-        return self.weight * hidden_states
+        return self.layer_norm(hidden_states)
 
 
 ALL_LAYERNORM_LAYERS.append(SwitchTransformersLayerNorm)
@@ -240,8 +227,8 @@ ALL_LAYERNORM_LAYERS.append(SwitchTransformersLayerNorm)
 class SwitchTransformersDenseActDense(nn.Module):
     def __init__(self, config: SwitchTransformersConfig):
         super().__init__()
-        self.wi = nn.Linear(config.d_model, config.d_ff, bias=False)
-        self.wo = nn.Linear(config.d_ff, config.d_model, bias=False)
+        self.wi = nn.Linear(config.d_model, config.d_ff, bias=True)
+        self.wo = nn.Linear(config.d_ff, config.d_model, bias=True)
         self.dropout = nn.Dropout(config.dropout_rate)
         self.act = ACT2FN[config.dense_act_fn]
 
@@ -297,7 +284,7 @@ class SwitchTransformersSparseMLP(nn.Module):
 
         router_mask = router_mask.bool()
         batch_size, seq_len, num_experts = router_mask.shape
-        idx_mask = router_mask.transpose(1, 2).reshape(batch_size * seq_len, num_experts).sum(dim=0)
+        idx_mask = router_mask.reshape(batch_size * seq_len, num_experts).sum(dim=0)
         idx_mask = torch.nonzero(idx_mask, as_tuple=True)[
             0
         ].tolist()  # length: number of "activated" expert / value: index
@@ -367,10 +354,10 @@ class SwitchTransformersAttention(nn.Module):
         self.inner_dim = self.n_heads * self.key_value_proj_dim
 
         # Mesh TensorFlow initialization to avoid scaling before softmax
-        self.q = nn.Linear(self.d_model, self.inner_dim, bias=False)
-        self.k = nn.Linear(self.d_model, self.inner_dim, bias=False)
-        self.v = nn.Linear(self.d_model, self.inner_dim, bias=False)
-        self.o = nn.Linear(self.inner_dim, self.d_model, bias=False)
+        self.q = nn.Linear(self.d_model, self.inner_dim, bias=True)
+        self.k = nn.Linear(self.d_model, self.inner_dim, bias=True)
+        self.v = nn.Linear(self.d_model, self.inner_dim, bias=True)
+        self.o = nn.Linear(self.inner_dim, self.d_model, bias=True)
 
         if self.has_relative_attention_bias:
             self.relative_attention_bias = nn.Embedding(self.relative_attention_num_buckets, self.n_heads)
@@ -807,7 +794,8 @@ class SwitchTransformersPreTrainedModel(PreTrainedModel):
         """Initialize the weights"""
         factor = self.config.initializer_factor  # Used for testing weights initialization
         if isinstance(module, SwitchTransformersLayerNorm):
-            module.weight.data.fill_(factor * 1.0)
+            module.layer_norm.bias.data.zero_()
+            module.layer_norm.weight.data.fill_(factor * 1.0)
         elif isinstance(
             module,
             (SwitchTransformersModel, SwitchTransformersForConditionalGeneration, SwitchTransformersEncoderModel),
@@ -1477,7 +1465,7 @@ class SwitchTransformersForConditionalGeneration(SwitchTransformersPreTrainedMod
         decoder_config.num_layers = config.num_decoder_layers
         self.decoder = SwitchTransformersStack(decoder_config, self.shared)
 
-        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=True)
 
         self.router_z_loss_coef = config.router_z_loss_coef
         self.router_aux_loss_coef = config.router_aux_loss_coef
